@@ -1,0 +1,39 @@
+IR AST:
+
+- `Identifier`
+- `Literal`
+  - `RegExpLiteral`
+- Statements
+  - `EmptyStatement`: maximum of one and only at the end of Context
+  - `ExpressionStatement`
+  - `DebuggerStatement`
+  - Control flow
+	- `GotoStatement`: only `ExpressionStatement(CallExpression(Identifier("GOTO"), [Literal(statementIndex: number)]))`
+  	- `IfStatement`: only `IfStatement(test: Expression, GotoStatement)`
+  - `Loops`
+    - `ForInStatement`
+- Declarations
+  - `VariableDeclaration`: maximum of one and only at the beginning of Context
+    - `VariableDeclarator`
+- Expressions
+  - `ThisExpression`
+  - `ArrayExpression`
+  - `ObjectExpression`
+    - `Property`
+  - `FunctionExpression`
+  - Unary operations
+    - `UnaryExpression`
+      - `UnaryOperator`
+    - `UpdateExpression`
+      - `UpdateOperator`
+  - Binary operations
+    - `BinaryExpression`
+      - `BinaryOperator`
+    - `AssignmentExpression`: only simple assignment (`operator` is `=`, `left` is `Identifier`)
+    - `LogicalExpression`
+      - `LogicalOperator`
+    - `MemberExpression`
+  - `ConditionalExpression`
+  - `CallExpression`
+  - `NewExpression`
+  - `SequenceExpression`

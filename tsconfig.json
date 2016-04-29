@@ -1,0 +1,15 @@
+{
+    "compileOnSave": true,
+    "compilerOptions": {
+        "noImplicitAny": true,
+        "target": "es6",
+        "module": "commonjs",
+		"sourceMap": true,
+		"strictNullChecks": true
+    },
+    "files": [
+        "typings/main.d.ts",
+		"escodegen.d.ts",
+        "index.ts"
+    ]
+}

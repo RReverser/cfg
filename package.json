@@ -1,0 +1,16 @@
+{
+  "name": "reloop",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "acorn": "^3.1.0",
+    "better-log": "^1.3.3",
+    "escodegen": "^1.8.0"
+  }
+}
