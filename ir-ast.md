@@ -8,8 +8,8 @@ IR AST:
   - `ExpressionStatement`
   - `DebuggerStatement`
   - Control flow
-	- `GotoStatement`: only `ExpressionStatement(CallExpression(Identifier("GOTO"), [Literal(statementIndex: number)]))`
-  	- `IfStatement`: only `IfStatement(test: Expression, GotoStatement)`
+    - `GotoStatement`: only `ExpressionStatement(CallExpression(Identifier("GOTO"), [Literal(statementIndex: number)]))`
+  - `IfStatement`: only `IfStatement(test: Expression, GotoStatement)`
   - `Loops`
     - `ForInStatement`
 - Declarations
