@@ -2,6 +2,7 @@
     "compileOnSave": true,
     "compilerOptions": {
         "noImplicitAny": true,
+        "noImplicitThis": true,
         "target": "es6",
         "module": "commonjs",
 		"sourceMap": true,

@@ -4,6 +4,8 @@ import { parse } from 'acorn';
 import { readFileSync, writeFileSync } from 'fs';
 import { generate } from 'escodegen';
 
+type ReusableExpr = ESTree.Identifier | ESTree._SimpleLiteral;
+
 interface GotoStmt {
 	stmt: ESTree.Statement;
 }
@@ -16,38 +18,153 @@ interface GotoResolve {
 	resolve(): void;
 }
 
-type GotoCall = ESTree.CallExpression & {
-	callee: ESTree.Identifier & { name: 'GOTO' },
-	arguments: [ESTree.Literal & { value: number }]
-};
+interface GotoArg extends ESTree._SimpleLiteral {
+	value?: number;
+}
 
-type GotoStatement = ESTree.ExpressionStatement & {
-	expression: GotoCall
-};
+interface GotoCall extends ESTree.CallExpression {
+	callee: ESTree.Identifier & { name: 'GOTO' };
+	arguments: [GotoArg];
+}
 
-type BranchingGotoStatement = ESTree.IfStatement & {
-	consequent: GotoStatement,
-	alternate?: undefined
-};
+interface GotoStatement extends ESTree.ExpressionStatement {
+	expression: GotoCall;
+}
 
-type SimplifiedAssignmentExpression = ESTree.AssignmentExpression & {
-	left: ESTree.Identifier,
-	operator: '='
+interface BranchingGotoStatement extends ESTree.IfStatement {
+	consequent: GotoStatement;
+	alternate?: undefined;
+}
+
+interface TempVar extends ESTree.Identifier {
+	kind: 'temp';
+}
+
+function isTempVar(node: ESTree.Expression): node is TempVar {
+	return is(node, 'Identifier') && (node as TempVar).kind === 'temp';
+}
+
+function isSimpleLiteral(node: ESTree.Expression): node is ESTree._SimpleLiteral {
+	return is(node, 'Literal') && !(node.value instanceof RegExp);
+}
+
+function is(node: ESTree.Node, type: 'Identifier'): node is ESTree.Identifier;
+function is(node: ESTree.Node, type: 'MemberExpression'): node is ESTree.MemberExpression;
+function is(node: ESTree.Node, type: 'VariableDeclaration'): node is ESTree.VariableDeclaration;
+function is(node: ESTree.Node, type: 'Literal'): node is ESTree.Literal;
+function is(node: ESTree.Node, type: 'FunctionExpression'): node is ESTree.FunctionExpression;
+function is(node: ESTree.Node, type: string): boolean {
+	return node.type === type;
+}
+
+const build = {
+	ident<T extends string>(name: T): ESTree.Identifier & { name: T } {
+		return {
+			type: 'Identifier',
+			name
+		};
+	},
+
+	literal<T extends string | boolean | number>(value?: T): ESTree.Literal & { value?: T } {
+		return {
+			type: 'Literal',
+			value
+		};
+	},
+
+	exprStmt<T extends ESTree.Expression>(expression: T): ESTree.ExpressionStatement & { expression: T } {
+		return {
+			type: 'ExpressionStatement',
+			expression
+		};
+	},
+
+	callExpr<C extends ESTree.Expression, A extends any[]>(callee: C, args: A): ESTree.CallExpression & { callee: C, arguments: A } {
+		return {
+			type: 'CallExpression',
+			callee,
+			arguments: args
+		};
+	},
+
+	binExpr<L extends ESTree.Expression, O extends ESTree.BinaryOperator, R extends ESTree.Expression>(left: L, operator: O, right: R): ESTree.BinaryExpression & { left: L, operator: O, right: R } {
+		return {
+			type: 'BinaryExpression',
+			left,
+			operator,
+			right
+		};
+	},
+
+	unExpr<O extends ESTree.UnaryOperator, T extends ESTree.Expression>(operator: O, argument: T): ESTree.UnaryExpression & { operator: O, argument: T } {
+		return {
+			type: 'UnaryExpression',
+			operator,
+			argument
+		};
+	},
+
+	gotoStmt(arg: GotoArg): GotoStatement {
+		return build.exprStmt(build.callExpr(build.ident<'GOTO'>('GOTO'), [arg] as [typeof arg]));
+	},
+
+	undef() {
+		return build.ident<'undefined'>('undefined');
+	},
+
+	emptyStmt(): ESTree.EmptyStatement {
+		return {
+			type: 'EmptyStatement'
+		};
+	},
+
+	varDeclarator<L extends ESTree.Identifier, R extends ESTree.Expression | undefined>(id: L, init?: R): ESTree.VariableDeclarator & { id: L, init?: R } {
+		return {
+			type: 'VariableDeclarator',
+			id,
+			init
+		};
+	},
+
+	varDeclaration(declarations: ESTree.VariableDeclarator[]): ESTree.VariableDeclaration {
+		return {
+			type: 'VariableDeclaration',
+			kind: 'var',
+			declarations
+		};
+	},
+
+	assignExpr<L extends ESTree.Identifier, O extends ESTree.AssignmentOperator, R extends ESTree.Expression>(left: L, operator: O, right: R): ESTree.AssignmentExpression & { left: L, operator: O, right: R } {
+		return {
+			type: 'AssignmentExpression',
+			left,
+			operator,
+			right
+		};
+	},
+
+	branchingGotoStmt<T extends ESTree.Expression>(test: T, goto: GotoStatement): BranchingGotoStatement {
+		return {
+			type: 'IfStatement',
+			test,
+			consequent: goto
+		};
+	},
+
+	program(body: ESTree.Statement[]): ESTree.Program {
+		return {
+			type: 'Program',
+			body
+		};
+	}
 };
 
 class Goto {
 	private _inserted = false;
 	private _confirmed = false;
-	private _gotoArg: ESTree.Literal = { type: 'Literal', value: undefined };
+	private _gotoArg: GotoArg = build.literal<number>();
 
-	private _stmt: GotoStatement = {
-		type: 'ExpressionStatement',
-		expression: {
-			type: 'CallExpression',
-			callee: { type: 'Identifier', name: 'GOTO' },
-			arguments: [this._gotoArg]
-		} as GotoCall
-	};
+	private _stmt: GotoStatement = build.gotoStmt(this._gotoArg);
 
 	constructor(private _context: Context) {}
 
@@ -61,7 +178,7 @@ class Goto {
 			}
 		}
 	}
-	
+
 	getForInsertion() {
 		this._inserted = true;
 		this._confirm();
@@ -82,12 +199,11 @@ class Goto {
 }
 
 class Context {
-	static UNDEF: ESTree.Identifier = { type: 'Identifier', name: 'undefined' };
-	static __RESULT: ESTree.Identifier = { type: 'Identifier', name: '__RESULT' };
-	static __ERROR: ESTree.Identifier = { type: 'Identifier', name: '__ERROR' };
+	static __RESULT = build.ident('__RESULT')
+	static __ERROR = build.ident('__ERROR');
 
 	varCounter = 0;
-	freeVars: ESTree.Identifier[] = [];
+	freeVars: TempVar[] = [];
 
 	scopeVars = new Map<string, ESTree.VariableDeclarator>();
 
@@ -105,51 +221,53 @@ class Context {
 	addScopeVar(id: ESTree.Identifier) {
 		let scopeVar = this.scopeVars.get(id.name);
 		if (scopeVar === undefined) {
-			scopeVar = {
-				type: 'VariableDeclarator',
-				id
-			};
+			scopeVar = build.varDeclarator(id);
 			this.scopeVars.set(id.name, scopeVar);
 		}
 		return scopeVar;
 	}
 
-	constructor(public isFunction: boolean) {
-		this.addScopeVar(Context.__ERROR);
-	}
+	constructor() {}
 
 	pos(): number {
 		return this.statements.length;
 	}
 
 	assign(id: ESTree.Identifier, init: ESTree.Expression, insert?: boolean) {
-		const stmt = {
-			type: 'ExpressionStatement',
-			expression: {
-				type: 'AssignmentExpression',
-				left: id,
-				operator: '=',
-				right: this.transformExpr(init)
-			} as ESTree.AssignmentExpression
-		} as ESTree.ExpressionStatement;
-		if (insert) {
+		const stmt = build.exprStmt(build.assignExpr(id, '=', this.transformExpr(init)));
+		if (insert !== false) {
 			this.statements.push(stmt);
 		}
 		return stmt;
 	}
 
-	useTempVar(init: ESTree.Expression) {
+	execForeign(name: string, args: ESTree.Expression[]) {
+		const evaluatedArgs = args.map(arg => this.useTempVar(arg));
+		this.statements.push(build.exprStmt(build.callExpr(build.ident(name), evaluatedArgs)));
+		evaluatedArgs.forEach(arg => this.freeTempVar(arg));
+		const goto = this._createGoto();
+		this.statements.push(build.branchingGotoStmt(Context.__ERROR, goto.getForInsertion()));
+		this.pendingThrows.push(goto);
+		return Context.__RESULT;
+	}
+
+	useTempVar(init: ESTree.Expression): ReusableExpr {
+		if (isTempVar(init) || isSimpleLiteral(init)) {
+			return init;
+		}
 		let id = this.freeVars.pop();
 		if (!id) {
-			id = { type: 'Identifier', name: `__TEMP_${this.varCounter++}` };
+			id = Object.assign(build.ident(`$${this.varCounter++}`), { kind: 'temp' as 'temp' });
 			this.addScopeVar(id);
 		}
 		this.assign(id, init);
 		return id;
 	}
 
-	freeTempVar(id: ESTree.Identifier) {
-		this.freeVars.push(id);
+	freeTempVar(id: ReusableExpr) {
+		if (isTempVar(id)) {
+			this.freeVars.push(id);
+		}
 	}
 
 	shadowVar(id: ESTree.Identifier, init: ESTree.Expression) {
@@ -185,15 +303,10 @@ class Context {
 
 	insertBranchStart(test: ESTree.Expression): GotoResolve {
 		const goto = this._createGoto();
-		this.statements.push({
-			type: 'IfStatement',
-			test: this.transformExpr({
-				type: 'UnaryExpression',
-				operator: '!',
-				argument: test
-			} as ESTree.UnaryExpression),
-			consequent: goto.getForInsertion()
-		} as BranchingGotoStatement);
+		test = this.useTempVar(build.unExpr('!', test));
+		const branch = build.branchingGotoStmt(test, goto.getForInsertion());
+		this.freeTempVar(test);
+		this.statements.push(branch);
 		return goto;
 	}
 
@@ -235,11 +348,11 @@ class Context {
 			/* TS#8377 */ if (ret) ret.resolve();
 		}
 		if (this.hadGotos.has(this.statements.length)) {
-			this.statements.push({ type: 'EmptyStatement' });
+			this.statements.push(build.emptyStmt());
 		}
 		for (let i = 0; i < this.statements.length; i++) {
 			if (this.hadGotos.has(i)) {
-				(this.statements[i] as any).leadingComments = [{ type: 'Line', value: ` ${i}:` }];
+				this.statements[i].leadingComments = [{ type: 'Line', value: ` ${i}:` }];
 			}
 		}
 		if (this.scopeVars.size > 0) {
@@ -248,17 +361,13 @@ class Context {
 			for (let varDecl of this.scopeVars.values()) {
 				/* TS#8377 */ if (varDecl) {
 					if (varDecl.init) {
-						varInits.push(this.assign(varDecl.id as ESTree.Identifier, varDecl.init));
+						varInits.push(this.assign(varDecl.id, varDecl.init, false));
 						varDecl.init = undefined;
 					}
 					varDecls.push(varDecl);
 				}
 			}
-			this.statements = [].concat({
-				type: 'VariableDeclaration',
-				kind: 'var',
-				declarations: varDecls
-			} as ESTree.VariableDeclaration, varInits, this.statements);
+			this.statements = [].concat(build.varDeclaration(varDecls), varInits, this.statements);
 		}
 	}
 
@@ -268,7 +377,7 @@ class Context {
 		}
 		stmtHandlers[stmt.type](this, stmt);
 	}
-	
+
 	transformExpr(expr: ESTree.Expression) {
 		if (!(expr.type in exprHandlers)) {
 			throw new ReferenceError(`Unhandled type ${expr.type}.`);
@@ -278,13 +387,8 @@ class Context {
 }
 
 const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement) => void } = {
-	Program(context: Context, node: ESTree.Program) {
-		node.body.forEach(node => context.transformStmt(node));
-	},
-
 	ExpressionStatement(context: Context, node: ESTree.ExpressionStatement) {
-		node.expression = context.transformExpr(node.expression);
-		context.statements.push(node);
+		context.transformExpr(node.expression);
 	},
 
 	DebuggerStatement(context: Context, node: ESTree.DebuggerStatement) {
@@ -365,24 +469,14 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 
 	ForStatement(context: Context, node: ESTree.ForStatement) {
 		if (node.init) {
-			let stmt = node.init;
-			if (stmt.type !== 'VariableDeclaration') {
-				stmt = {
-					type: 'ExpressionStatement',
-					expression: node.init
-				} as ESTree.ExpressionStatement;
-			}
-			context.transformStmt(stmt);
+			context.transformStmt(is(node.init, 'VariableDeclaration') ? node.init : build.exprStmt(node.init));
 		}
 		const start = context.createGotoToHere();
 		const rejectBranch = node.test && context.insertBranchStart(node.test);
 		context.intoBlock('', true);
 		context.transformStmt(node.body);
 		if (node.update) {
-			context.transformStmt({
-				type: 'ExpressionStatement',
-				expression: node.update
-			} as ESTree.ExpressionStatement);
+			context.transformStmt(build.exprStmt(node.update));
 		}
 		start.insert();
 		if (rejectBranch) {
@@ -403,12 +497,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 			from: GotoInsert
 		} | undefined>((defaultCase, switchCase) => {
 			if (switchCase.test) {
-				const rejectBranch = context.insertBranchStart({
-					type: 'BinaryExpression',
-					left: localId,
-					right: switchCase.test,
-					operator: '==='
-				} as ESTree.BinaryExpression);
+				const rejectBranch = context.insertBranchStart(build.binExpr(localId, '===', switchCase.test));
 				prevLeave.resolve();
 				for (const stmt of switchCase.consequent) {
 					/* TS#8377 */ if (stmt) context.transformStmt(stmt);
@@ -438,18 +527,17 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 
 	VariableDeclaration(context: Context, node: ESTree.VariableDeclaration) {
 		node.declarations.forEach(decl => {
-			const id = decl.id as ESTree.Identifier;
-			context.addScopeVar(decl.id as ESTree.Identifier);
+			context.addScopeVar(decl.id);
 			if (decl.init) {
-				context.assign(id, decl.init);
+				context.assign(decl.id, decl.init);
 			}
 		});
 	},
 
 	FunctionDeclaration(context: Context, node: ESTree.FunctionDeclaration) {
-		context.addScopeVar(node.id).init = context.transformExpr(Object.assign(node, {
+		context.addScopeVar(node.id).init = Object.assign(node, {
 			type: 'FunctionExpression' as 'FunctionExpression'
-		}) as ESTree.FunctionExpression);
+		});
 	},
 
 	ThrowStatement(context: Context, node: ESTree.ThrowStatement) {
@@ -468,8 +556,8 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 
 			context.pendingThrows = [];
 
-			const outerVar = context.shadowVar(node.handler.param as ESTree.Identifier, Context.__ERROR);
-			context.assign(Context.__ERROR, Context.UNDEF);
+			const outerVar = context.shadowVar(node.handler.param, Context.__ERROR);
+			context.assign(Context.__ERROR, build.undef());
 
 			context.transformStmt(node.handler.body);
 
@@ -487,47 +575,78 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	}
 };
 
-const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression) => ESTree.Identifier | ESTree.Literal | ESTree.FunctionExpression | SimplifiedAssignmentExpression } = {
-	Literal(_: Context, node: ESTree.Literal): ESTree.Literal {
+const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression) => ESTree.Expression } = {
+	Literal(context: Context, node: ESTree.Literal) {
 		return node;
 	},
 
-	Identifier(_: Context, node: ESTree.Identifier): ESTree.Identifier {
+	Identifier(context: Context, node: ESTree.Identifier) {
 		return node;
 	},
 
-	FunctionExpression(_: Context, node: ESTree.FunctionExpression): ESTree.FunctionExpression {
-		const context = new Context(true);
-		context.addScopeVar(Context.__RESULT);
-		context.transformStmt(node.body);
-		(node.body as ESTree.BlockStatement).body = context.statements;
-		context.leave();
+	FunctionExpression(context: Context, node: ESTree.FunctionExpression) {
+		const funcContext = new Context();
+		funcContext.transformStmt(node.body);
+		node.body.body = funcContext.statements;
+		funcContext.leave();
 		return node;
 	},
-	
-	AssignmentExpression(_: Context, node: ESTree.AssignmentExpression): SimplifiedAssignmentExpression {
-		return node;
+
+	MemberExpression(context: Context, node: ESTree.MemberExpression) {
+		let { object, property } = node;
+		if (!node.computed) {
+			property = build.literal((property as ESTree.Identifier).name);
+		}
+		return context.execForeign('GET_PROPERTY', [object, property]);
 	},
-	
-	UnaryExpression(_: Context, node: ESTree.UnaryExpression): ESTree.UnaryExpression {
-		return node;
+
+	AssignmentExpression(context: Context, node: ESTree.AssignmentExpression) {
+		if (is(node.left, 'MemberExpression')) {
+			let { object, property } = node.left;
+			if (!node.left.computed) {
+				property = build.literal((property as ESTree.Identifier).name);
+			}
+			return context.execForeign('SET_PROPERTY', [object, property, node.right]);
+		} else {
+			context.assign(node.left, node.right);
+			return node.left;
+		}
 	},
-	
-	CallExpression(_: Context, node: ESTree.CallExpression): ESTree.CallExpression {
-		return node;
+
+	CallExpression(context: Context, node: ESTree.CallExpression) {
+		let thisExpr: ReusableExpr | undefined;
+		let callee = node.callee;
+		if (is(callee, 'MemberExpression')) {
+			thisExpr = callee.object = context.useTempVar(callee.object);
+		}
+		return context.execForeign('CALL', [callee, thisExpr || build.undef()].concat(node.arguments));
+	},
+
+	UnaryExpression(context: Context, node: ESTree.UnaryExpression) {
+		const arg = context.useTempVar(node.argument);
+		const unExpr = build.unExpr(node.operator, arg);
+		context.freeTempVar(arg);
+		return unExpr;
+	},
+
+	BinaryExpression(context: Context, node: ESTree.BinaryExpression) {
+		const left = context.useTempVar(node.left);
+		const right = context.useTempVar(node.right);
+		const binExpr = build.binExpr(left, node.operator, right);
+		context.freeTempVar(left);
+		context.freeTempVar(right);
+		return binExpr;
 	}
 };
 
 {
 	const ast = parse(readFileSync('test.js', 'utf-8'), { locations: true });
 
-	const context = new Context(false);
-	context.transformStmt(ast);
+	const context = new Context();
+	context.addScopeVar(Context.__ERROR);
+	context.addScopeVar(Context.__RESULT);
+	ast.body.forEach(node => context.transformStmt(node));
 	context.leave();
 
-	writeFileSync('test.out.js', generate({
-		type: 'Program',
-		sourceType: ast.sourceType,
-		body: context.statements
-	} as ESTree.Program, { comment: true }));
+	writeFileSync('test.out.js', generate(build.program(context.statements), { comment: true }));
 }

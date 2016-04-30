@@ -8,7 +8,7 @@ IR AST:
   - `ExpressionStatement`
   - `DebuggerStatement`
   - Control flow
-    - `GotoStatement`: only `ExpressionStatement(CallExpression(Identifier("GOTO"), [Literal(statementIndex: number)]))`
+    - `GotoStatement`: `ExpressionStatement(CallExpression(Identifier("GOTO"), [Literal(statementIndex: number)]))`
   - `IfStatement`: only `IfStatement(test: Expression, GotoStatement)`
   - `Loops`
     - `ForInStatement`
@@ -29,7 +29,7 @@ IR AST:
   - Binary operations
     - `BinaryExpression`
       - `BinaryOperator`
-    - `AssignmentExpression`: only simple assignment (`operator` is `=`, `left` is `Identifier`)
+    - `AssignmentExpression`
     - `LogicalExpression`
       - `LogicalOperator`
     - `MemberExpression`
