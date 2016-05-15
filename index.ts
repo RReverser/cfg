@@ -19,7 +19,7 @@ interface GotoResolve {
 }
 
 interface GotoArg extends ESTree._SimpleLiteral {
-	value?: number;
+	value?: string;
 }
 
 interface BranchingGotoArg extends ESTree.ConditionalExpression {
@@ -35,6 +35,12 @@ interface GotoCall<A extends GotoArg | BranchingGotoArg> extends ESTree.CallExpr
 
 interface GotoStatement<A extends GotoArg | BranchingGotoArg> extends ESTree.ExpressionStatement {
 	expression: GotoCall<A>;
+}
+
+type BlockBody = (ESTree.ExpressionStatement | GotoStatement<any> | ESTree.DebuggerStatement)[];
+
+interface Block extends ESTree.LabeledStatement {
+	body: ESTree.BlockStatement & { body: BlockBody };
 }
 
 interface TempVar extends ESTree.Identifier {
@@ -162,39 +168,24 @@ const build = {
 };
 
 class Goto {
-	private _inserted = false;
-	private _confirmed = false;
-	private _gotoArg: GotoArg = build.literal<number>();
+	private _gotoArg: GotoArg = build.literal<string>();
 
 	constructor(private _context: Context) {}
 
-	private _confirm() {
-		if (this._confirmed) return;
-		if (this._inserted) {
-			const pos = this._gotoArg.value;
-			if (pos !== undefined) {
-				this._context.hadGotos.add(pos);
-				this._confirmed = true;
-			}
-		}
-	}
-
 	getForInsertion() {
-		this._inserted = true;
-		this._confirm();
 		return this._gotoArg;
 	}
 
 	insert() {
-		this._context.statements.push(build.gotoStmt(this.getForInsertion()));
+		this._context.currentBlock.push(build.gotoStmt(this.getForInsertion()));
+		this._context.startBlock();
 	}
 
 	resolve() {
 		if (this._gotoArg.value !== undefined) {
 			throw new Error('GOTO was already resolved.');
 		}
-		this._gotoArg.value = this._context.pos();
-		this._confirm();
+		this._gotoArg.value = this._context.startBlock();
 	}
 }
 
@@ -207,16 +198,31 @@ class Context {
 
 	scopeVars = new Map<string, ESTree.VariableDeclarator>();
 
-	statements: (ESTree.ExpressionStatement | ESTree.EmptyStatement | GotoStatement<any> | ESTree.DebuggerStatement)[] = [];
+	varBlock: BlockBody;
 
-	labelCounter = 0;
+	blocks: Block[] = [];
+	currentBlock: BlockBody;
 
 	labelStack: { name: string, goto: GotoInsert | undefined }[] = [];
 	pendingBreaks: { name: string, goto: GotoResolve }[] = [];
 	pendingReturns: GotoResolve[] = [];
 	pendingThrows: GotoResolve[] = [];
 
-	hadGotos = new Set();
+	startBlock() {
+		if (this.currentBlock && this.currentBlock.length === 0) {
+			return this.blocks[this.blocks.length - 1].label.name;
+		}
+		const name = `B${this.blocks.length}`;
+		this.blocks.push({
+			type: 'LabeledStatement',
+			label: build.ident(name),
+			body: {
+				type: 'BlockStatement' as 'BlockStatement',
+				body: this.currentBlock = []
+			}
+		});
+		return name;
+	}
 
 	addScopeVar(id: ESTree.Identifier) {
 		let scopeVar = this.scopeVars.get(id.name);
@@ -227,23 +233,22 @@ class Context {
 		return scopeVar;
 	}
 
-	constructor() {}
-
-	pos(): number {
-		return this.statements.length;
+	constructor() {
+		this.startBlock();
+		this.varBlock = this.currentBlock;
 	}
 
 	assign(id: ESTree.Identifier, init: ESTree.Expression, insert?: boolean) {
 		const stmt = build.exprStmt(build.assignExpr(id, '=', this.transformExpr(init)));
 		if (insert !== false) {
-			this.statements.push(stmt);
+			this.currentBlock.push(stmt);
 		}
 		return stmt;
 	}
 
 	execForeign(name: string, args: ESTree.Expression[]) {
 		const evaluatedArgs = args.map(arg => this.useTempVar(arg));
-		this.statements.push(build.exprStmt(build.callExpr(build.ident(name), evaluatedArgs)));
+		this.currentBlock.push(build.exprStmt(build.callExpr(build.ident(name), evaluatedArgs)));
 		for (const arg of evaluatedArgs) {
 			this.freeTempVar(arg);
 		}
@@ -259,7 +264,7 @@ class Context {
 			init.refCounter++;
 			return init;
 		}
-		if (isSimpleLiteral(init) || is(init, 'Identifier') && init.name === 'undefined') {
+		if (isSimpleLiteral(init) || is(init, 'Identifier') && init.name === 'undefined' || init === Context.__ERROR) {
 			return init;
 		}
 		let id = this.freeVars.pop();
@@ -318,7 +323,8 @@ class Context {
 		this.freeTempVar(test);
 		return {
 			insert: () => {
-				this.statements.push(branch);
+				this.currentBlock.push(branch);
+				this.startBlock();
 			},
 			consequent,
 			alternate
@@ -372,25 +378,11 @@ class Context {
 		for (const ret of this.pendingReturns) {
 			ret.resolve();
 		}
-		if (this.hadGotos.has(this.statements.length)) {
-			this.statements.push(build.emptyStmt());
-		}
-		for (let i = 0; i < this.statements.length; i++) {
-			if (this.hadGotos.has(i)) {
-				this.statements[i].leadingComments = [{ type: 'Line', value: ` ${i}:` }];
+		for (const varDecl of this.scopeVars.values()) {
+			if (varDecl.init) {
+				this.varBlock.push(this.assign(varDecl.id, varDecl.init, false));
+				varDecl.init = undefined;
 			}
-		}
-		if (this.scopeVars.size > 0) {
-			const varDecls: ESTree.VariableDeclarator[] = [];
-			const varInits: ESTree.ExpressionStatement[] = [];
-			for (let varDecl of this.scopeVars.values()) {
-				if (varDecl.init) {
-					varInits.push(this.assign(varDecl.id, varDecl.init, false));
-					varDecl.init = undefined;
-				}
-				varDecls.push(varDecl);
-			}
-			this.statements = [].concat(build.varDeclaration(varDecls), varInits, this.statements);
 		}
 	}
 
@@ -426,7 +418,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	},
 
 	DebuggerStatement(context: Context, node: ESTree.DebuggerStatement) {
-		context.statements.push(node);
+		context.currentBlock.push(node);
 	},
 
 	LabeledStatement(context: Context, node: ESTree.LabeledStatement) {
@@ -623,7 +615,7 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 	FunctionExpression(context: Context, node: ESTree.FunctionExpression) {
 		const funcContext = new Context();
 		funcContext.transformStmt(node.body);
-		node.body.body = funcContext.statements;
+		node.body.body = funcContext.blocks;
 		funcContext.leave();
 		return node;
 	},
@@ -655,7 +647,7 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 		if (is(callee, 'MemberExpression')) {
 			thisExpr = callee.object = context.useTempVar(callee.object);
 		}
-		const result = context.execForeign('CALL', [callee, thisExpr || build.undef()].concat(node.arguments));
+		const result = context.execForeign('CALL', [callee, thisExpr || build.undef(), ...node.arguments]);
 		if (thisExpr) {
 			context.freeTempVar(thisExpr);
 		}
@@ -690,5 +682,8 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 	}
 	context.leave();
 
-	writeFileSync('test.out.js', generate(build.program(context.statements), { comment: true }));
+	writeFileSync('test.out.js', generate(build.program([
+		build.varDeclaration([...context.scopeVars.values()]),
+		...context.blocks
+	]), { comment: true }));
 }
