@@ -6,34 +6,32 @@ import { generate } from 'escodegen';
 
 type ReusableExpr = ESTree.Identifier | ESTree._SimpleLiteral | ESTree.Identifier & { name: 'undefined' };
 
+interface BranchId extends ESTree.Identifier {}
+
 interface GotoStmt {
 	stmt: ESTree.Statement;
 }
 
-interface GotoInsert {
-	insert(): void;
-}
-
-interface GotoResolve {
+interface GotoInsertedResolve {
 	resolve(): void;
 }
 
-interface GotoArg extends ESTree._SimpleLiteral {
-	value?: string;
+interface GotoResolvedInsert {
+	insert(): void;
 }
 
-interface BranchingGotoArg extends ESTree.ConditionalExpression {
+interface ConditionalBranchId extends ESTree.ConditionalExpression {
 	test: ReusableExpr;
-	consequent: GotoArg;
-	alternate: GotoArg;
+	consequent: BranchId;
+	alternate: BranchId;
 }
 
-interface GotoCall<A extends GotoArg | BranchingGotoArg> extends ESTree.CallExpression {
+interface GotoCall<A extends BranchId | ConditionalBranchId> extends ESTree.CallExpression {
 	callee: ESTree.Identifier & { name: 'GOTO' };
 	arguments: [A];
 }
 
-interface GotoStatement<A extends GotoArg | BranchingGotoArg> extends ESTree.ExpressionStatement {
+interface GotoStatement<A extends BranchId | ConditionalBranchId> extends ESTree.ExpressionStatement {
 	expression: GotoCall<A>;
 }
 
@@ -111,7 +109,16 @@ const build = {
 		};
 	},
 
-	gotoStmt<A extends GotoArg | BranchingGotoArg>(arg: A): GotoStatement<A> {
+	condBranchId(test: ReusableExpr, consequent: BranchId, alternate: BranchId): ConditionalBranchId {
+		return {
+			type: 'ConditionalExpression',
+			test,
+			consequent,
+			alternate
+		};
+	},
+
+	gotoStmt<A extends BranchId | ConditionalBranchId>(arg: A): GotoStatement<A> {
 		return build.exprStmt(build.callExpr(build.ident<'GOTO'>('GOTO'), [arg] as [A]));
 	},
 
@@ -150,15 +157,6 @@ const build = {
 		};
 	},
 
-	branchingGotoStmt(test: ReusableExpr, consequent: GotoArg, alternate: GotoArg): GotoStatement<BranchingGotoArg> {
-		return build.gotoStmt<BranchingGotoArg>({
-			type: 'ConditionalExpression',
-			test,
-			consequent,
-			alternate
-		});
-	},
-
 	program(body: ESTree.Statement[]): ESTree.Program {
 		return {
 			type: 'Program',
@@ -168,30 +166,36 @@ const build = {
 };
 
 class Goto {
-	private _gotoArg: GotoArg = build.literal<string>();
+	private readonly _branchId: BranchId = build.ident('(unresolved)');
 
 	constructor(private _context: Context) {}
 
 	getForInsertion() {
-		return this._gotoArg;
+		return this._branchId;
 	}
 
-	insert() {
-		this._context.currentBlock.push(build.gotoStmt(this.getForInsertion()));
-		this._context.startBlock();
+	insert(): GotoInsertedResolve {
+		this._context.startBlock(this.getForInsertion());
+		return this;
 	}
 
-	resolve() {
-		if (this._gotoArg.value !== undefined) {
+	resolve(): GotoResolvedInsert {
+		if (this._branchId.name !== '(unresolved)') {
 			throw new Error('GOTO was already resolved.');
 		}
-		this._gotoArg.value = this._context.startBlock();
+		if (this._context.currentBlock.length !== 0) {
+			const joinGoto = this._context.createGoto();
+			this._context.startBlock(joinGoto.getForInsertion());
+			joinGoto.resolve();
+		}
+		this._branchId.name = this._context.blocks[this._context.blocks.length - 1].label.name;
+		return this;
 	}
 }
 
 class Context {
-	static __RESULT = build.ident('__RESULT')
-	static __ERROR = build.ident('__ERROR');
+	static readonly __RESULT = build.ident('__RESULT')
+	static readonly __ERROR = build.ident('__ERROR');
 
 	varCounter = 0;
 	freeVars: TempVar[] = [];
@@ -203,25 +207,25 @@ class Context {
 	blocks: Block[] = [];
 	currentBlock: BlockBody;
 
-	labelStack: { name: string, goto: GotoInsert | undefined }[] = [];
-	pendingBreaks: { name: string, goto: GotoResolve }[] = [];
-	pendingReturns: GotoResolve[] = [];
-	pendingThrows: GotoResolve[] = [];
+	labelStack: { name: string, goto: GotoResolvedInsert | undefined }[] = [];
+	pendingBreaks: { name: string, goto: GotoInsertedResolve }[] = [];
+	pendingReturns: GotoInsertedResolve[] = [];
+	pendingThrows: GotoInsertedResolve[] = [];
 
-	startBlock() {
-		if (this.currentBlock && this.currentBlock.length === 0) {
-			return this.blocks[this.blocks.length - 1].label.name;
+	startBlock(arg: BranchId | ConditionalBranchId | undefined): BranchId {
+		if (arg !== undefined) {
+			this.currentBlock.push(build.gotoStmt(arg));
 		}
-		const name = `B${this.blocks.length}`;
+		const id = build.ident(`B${this.blocks.length}`);
 		this.blocks.push({
 			type: 'LabeledStatement',
-			label: build.ident(name),
+			label: id,
 			body: {
 				type: 'BlockStatement' as 'BlockStatement',
 				body: this.currentBlock = []
 			}
 		});
-		return name;
+		return id;
 	}
 
 	addScopeVar(id: ESTree.Identifier) {
@@ -234,7 +238,7 @@ class Context {
 	}
 
 	constructor() {
-		this.startBlock();
+		this.startBlock(undefined);
 		this.varBlock = this.currentBlock;
 	}
 
@@ -301,37 +305,24 @@ class Context {
 		};
 	}
 
-	_createGoto() {
+	createGoto() {
 		return new Goto(this);
 	}
 
-	createGotoToHere(): GotoInsert {
-		const goto = this._createGoto();
-		goto.resolve();
-		return goto;
-	}
-
-	insertPendingGoto(): GotoResolve {
-		const goto = this._createGoto();
-		goto.insert();
-		return goto;
-	}
-
-	createBranch(test: ESTree.Expression, consequent = this._createGoto(), alternate = this._createGoto()): { insert: () => void, consequent: GotoResolve, alternate: GotoResolve } {
+	createBranch(test: ESTree.Expression, consequent = this.createGoto(), alternate = this.createGoto()): { insert: () => void, consequent: GotoInsertedResolve, alternate: GotoInsertedResolve } {
 		test = this.useTempVar(test);
-		const branch = build.branchingGotoStmt(test, consequent.getForInsertion(), alternate.getForInsertion());
+		const branch = build.condBranchId(test, consequent.getForInsertion(), alternate.getForInsertion());
 		this.freeTempVar(test);
 		return {
 			insert: () => {
-				this.currentBlock.push(branch);
-				this.startBlock();
+				this.startBlock(branch);
 			},
 			consequent,
 			alternate
 		};
 	}
 
-	insertBranchStart(test: ESTree.Expression): GotoResolve {
+	insertBranchStart(test: ESTree.Expression): GotoInsertedResolve {
 		const branch = this.createBranch(test);
 		branch.insert();
 		branch.consequent.resolve();
@@ -341,7 +332,7 @@ class Context {
 	intoBlock(name: string, canContinue: boolean) {
 		this.labelStack.push({
 			name,
-			goto: canContinue ? this.createGotoToHere() : undefined
+			goto: canContinue ? this.createGoto().resolve() : undefined
 		});
 	}
 
@@ -436,7 +427,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	BreakStatement(context: Context, node: ESTree.BreakStatement) {
 		context.pendingBreaks.push({
 			name: node.label ? node.label.name : '',
-			goto: context.insertPendingGoto()
+			goto: context.createGoto().insert()
 		});
 	},
 
@@ -444,7 +435,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 		if (node.argument) {
 			context.assign(Context.__RESULT, node.argument);
 		}
-		context.pendingReturns.push(context.insertPendingGoto());
+		context.pendingReturns.push(context.createGoto().insert());
 	},
 
 	ContinueStatement(context: Context, node: ESTree.ContinueStatement) {
@@ -466,7 +457,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 		const rejectBranch = context.insertBranchStart(node.test);
 		context.transformStmt(node.consequent);
 		if (node.alternate) {
-			const fulfillBranch = context.insertPendingGoto();
+			const fulfillBranch = context.createGoto().insert();
 			rejectBranch.resolve();
 			context.transformStmt(node.alternate);
 			fulfillBranch.resolve();
@@ -476,7 +467,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	},
 
 	WhileStatement(context: Context, node: ESTree.WhileStatement) {
-		const start = context.createGotoToHere();
+		const start = context.createGoto().resolve();
 		const rejectBranch = context.insertBranchStart(node.test);
 		context.intoBlock('', true);
 		context.transformStmt(node.body);
@@ -499,7 +490,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 		if (node.init) {
 			context.transformStmt(is(node.init, 'VariableDeclaration') ? node.init : build.exprStmt(node.init));
 		}
-		const start = context.createGotoToHere();
+		const start = context.createGoto().resolve();
 		const rejectBranch = node.test && context.insertBranchStart(node.test);
 		context.intoBlock('', true);
 		context.transformStmt(node.body);
@@ -517,12 +508,12 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 
 	SwitchStatement(context: Context, node: ESTree.SwitchStatement) {
 		context.intoBlock('', false);
-		let prevLeave: GotoResolve = { resolve() {} };
+		let prevLeave: GotoInsertedResolve = { resolve() {} };
 		const localId = context.useTempVar(node.discriminant);
 		const defaultCase = node.cases.reduce<{
-			to: GotoResolve,
+			to: GotoInsertedResolve,
 			consequent: ESTree.Statement[],
-			from: GotoInsert
+			from: GotoResolvedInsert
 		} | undefined>((defaultCase, switchCase) => {
 			if (switchCase.test) {
 				const rejectBranch = context.insertBranchStart(build.binExpr(localId, '===', switchCase.test));
@@ -530,14 +521,14 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 				for (const stmt of switchCase.consequent) {
 					context.transformStmt(stmt);
 				}
-				prevLeave = context.insertPendingGoto();
+				prevLeave = context.createGoto().insert();
 				rejectBranch.resolve();
 				return defaultCase;
 			} else {
 				return {
 					to: prevLeave,
 					consequent: switchCase.consequent,
-					from: prevLeave = context._createGoto()
+					from: prevLeave = context.createGoto()
 				};
 			}
 		}, undefined);
@@ -570,13 +561,13 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 
 	ThrowStatement(context: Context, node: ESTree.ThrowStatement) {
 		context.assign(Context.__ERROR, node.argument);
-		context.pendingThrows.push(context.insertPendingGoto());
+		context.pendingThrows.push(context.createGoto().insert());
 	},
 
 	TryStatement(context: Context, node: ESTree.TryStatement) {
 		context.transformStmt(node.block);
 		if (node.handler && context.pendingThrows.length > 0) {
-			const allGood = context.insertPendingGoto();
+			const allGood = context.createGoto().insert();
 
 			for (const goto of context.pendingThrows) {
 				goto.resolve();
