@@ -22,18 +22,19 @@ interface GotoArg extends ESTree._SimpleLiteral {
 	value?: number;
 }
 
-interface GotoCall extends ESTree.CallExpression {
+interface BranchingGotoArg extends ESTree.ConditionalExpression {
+	test: ReusableExpr;
+	consequent: GotoArg;
+	alternate: GotoArg;
+}
+
+interface GotoCall<A extends GotoArg | BranchingGotoArg> extends ESTree.CallExpression {
 	callee: ESTree.Identifier & { name: 'GOTO' };
-	arguments: [GotoArg];
+	arguments: [A];
 }
 
-interface GotoStatement extends ESTree.ExpressionStatement {
-	expression: GotoCall;
-}
-
-interface BranchingGotoStatement extends ESTree.IfStatement {
-	consequent: GotoStatement;
-	alternate?: undefined;
+interface GotoStatement<A extends GotoArg | BranchingGotoArg> extends ESTree.ExpressionStatement {
+	expression: GotoCall<A>;
 }
 
 interface TempVar extends ESTree.Identifier {
@@ -104,8 +105,8 @@ const build = {
 		};
 	},
 
-	gotoStmt(arg: GotoArg): GotoStatement {
-		return build.exprStmt(build.callExpr(build.ident<'GOTO'>('GOTO'), [arg] as [typeof arg]));
+	gotoStmt<A extends GotoArg | BranchingGotoArg>(arg: A): GotoStatement<A> {
+		return build.exprStmt(build.callExpr(build.ident<'GOTO'>('GOTO'), [arg] as [A]));
 	},
 
 	undef() {
@@ -143,12 +144,13 @@ const build = {
 		};
 	},
 
-	branchingGotoStmt<T extends ESTree.Expression>(test: T, goto: GotoStatement): BranchingGotoStatement {
-		return {
-			type: 'IfStatement',
+	branchingGotoStmt(test: ReusableExpr, consequent: GotoArg, alternate: GotoArg): GotoStatement<BranchingGotoArg> {
+		return build.gotoStmt<BranchingGotoArg>({
+			type: 'ConditionalExpression',
 			test,
-			consequent: goto
-		};
+			consequent,
+			alternate
+		});
 	},
 
 	program(body: ESTree.Statement[]): ESTree.Program {
@@ -163,8 +165,6 @@ class Goto {
 	private _inserted = false;
 	private _confirmed = false;
 	private _gotoArg: GotoArg = build.literal<number>();
-
-	private _stmt: GotoStatement = build.gotoStmt(this._gotoArg);
 
 	constructor(private _context: Context) {}
 
@@ -182,11 +182,11 @@ class Goto {
 	getForInsertion() {
 		this._inserted = true;
 		this._confirm();
-		return this._stmt;
+		return this._gotoArg;
 	}
 
 	insert() {
-		this._context.statements.push(this.getForInsertion());
+		this._context.statements.push(build.gotoStmt(this.getForInsertion()));
 	}
 
 	resolve() {
@@ -207,7 +207,7 @@ class Context {
 
 	scopeVars = new Map<string, ESTree.VariableDeclarator>();
 
-	statements: (ESTree.ExpressionStatement | ESTree.EmptyStatement | GotoStatement | BranchingGotoStatement | ESTree.DebuggerStatement)[] = [];
+	statements: (ESTree.ExpressionStatement | ESTree.EmptyStatement | GotoStatement<any> | ESTree.DebuggerStatement)[] = [];
 
 	labelCounter = 0;
 
@@ -244,10 +244,13 @@ class Context {
 	execForeign(name: string, args: ESTree.Expression[]) {
 		const evaluatedArgs = args.map(arg => this.useTempVar(arg));
 		this.statements.push(build.exprStmt(build.callExpr(build.ident(name), evaluatedArgs)));
-		evaluatedArgs.forEach(arg => this.freeTempVar(arg));
-		const goto = this._createGoto();
-		this.statements.push(build.branchingGotoStmt(Context.__ERROR, goto.getForInsertion()));
-		this.pendingThrows.push(goto);
+		for (const arg of evaluatedArgs) {
+			this.freeTempVar(arg);
+		}
+		const branch = this.createBranch(Context.__ERROR);
+		branch.insert();
+		this.pendingThrows.push(branch.consequent);
+		branch.alternate.resolve();
 		return Context.__RESULT;
 	}
 
@@ -309,13 +312,24 @@ class Context {
 		return goto;
 	}
 
-	insertBranchStart(test: ESTree.Expression): GotoResolve {
-		const goto = this._createGoto();
-		test = this.useTempVar(build.unExpr('!', test));
-		const branch = build.branchingGotoStmt(test, goto.getForInsertion());
+	createBranch(test: ESTree.Expression, consequent = this._createGoto(), alternate = this._createGoto()): { insert: () => void, consequent: GotoResolve, alternate: GotoResolve } {
+		test = this.useTempVar(test);
+		const branch = build.branchingGotoStmt(test, consequent.getForInsertion(), alternate.getForInsertion());
 		this.freeTempVar(test);
-		this.statements.push(branch);
-		return goto;
+		return {
+			insert: () => {
+				this.statements.push(branch);
+			},
+			consequent,
+			alternate
+		};
+	}
+
+	insertBranchStart(test: ESTree.Expression): GotoResolve {
+		const branch = this.createBranch(test);
+		branch.insert();
+		branch.consequent.resolve();
+		return branch.alternate;
 	}
 
 	intoBlock(name: string, canContinue: boolean) {
@@ -353,10 +367,10 @@ class Context {
 			throw new Error(`Attempted to leave the context with unresolved break statements: ${this.pendingBreaks.map(label => label.name).join(', ')}`);
 		}
 		for (const err of this.pendingThrows) {
-			/* TS#8377 */ if (err) err.resolve();
+			err.resolve();
 		}
 		for (const ret of this.pendingReturns) {
-			/* TS#8377 */ if (ret) ret.resolve();
+			ret.resolve();
 		}
 		if (this.hadGotos.has(this.statements.length)) {
 			this.statements.push(build.emptyStmt());
@@ -370,13 +384,11 @@ class Context {
 			const varDecls: ESTree.VariableDeclarator[] = [];
 			const varInits: ESTree.ExpressionStatement[] = [];
 			for (let varDecl of this.scopeVars.values()) {
-				/* TS#8377 */ if (varDecl) {
-					if (varDecl.init) {
-						varInits.push(this.assign(varDecl.id, varDecl.init, false));
-						varDecl.init = undefined;
-					}
-					varDecls.push(varDecl);
+				if (varDecl.init) {
+					varInits.push(this.assign(varDecl.id, varDecl.init, false));
+					varDecl.init = undefined;
 				}
+				varDecls.push(varDecl);
 			}
 			this.statements = [].concat(build.varDeclaration(varDecls), varInits, this.statements);
 		}
@@ -424,7 +436,9 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	},
 
 	BlockStatement(context: Context, node: ESTree.BlockStatement) {
-		node.body.forEach(node => context.transformStmt(node));
+		for (const stmt of node.body) {
+			context.transformStmt(stmt);
+		}
 	},
 
 	BreakStatement(context: Context, node: ESTree.BreakStatement) {
@@ -480,13 +494,13 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	},
 
 	DoWhileStatement(context: Context, node: ESTree.DoWhileStatement) {
-		const start = context.createGotoToHere();
+		const branch = context.createBranch(node.test);
+		branch.consequent.resolve();
 		context.intoBlock('', true);
 		context.transformStmt(node.body);
-		const rejectBranch = context.insertBranchStart(node.test);
-		start.insert();
-		rejectBranch.resolve();
+		branch.insert();
 		context.leaveBlock();
+		branch.alternate.resolve();
 	},
 
 	ForStatement(context: Context, node: ESTree.ForStatement) {
@@ -522,7 +536,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 				const rejectBranch = context.insertBranchStart(build.binExpr(localId, '===', switchCase.test));
 				prevLeave.resolve();
 				for (const stmt of switchCase.consequent) {
-					/* TS#8377 */ if (stmt) context.transformStmt(stmt);
+					context.transformStmt(stmt);
 				}
 				prevLeave = context.insertPendingGoto();
 				rejectBranch.resolve();
@@ -539,7 +553,7 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 		if (defaultCase) {
 			defaultCase.to.resolve();
 			for (const stmt of defaultCase.consequent) {
-				/* TS#8377 */ if (stmt) context.transformStmt(stmt);
+				context.transformStmt(stmt);
 			}
 			defaultCase.from.insert();
 		}
@@ -548,12 +562,12 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 	},
 
 	VariableDeclaration(context: Context, node: ESTree.VariableDeclaration) {
-		node.declarations.forEach(decl => {
+		for (const decl of node.declarations) {
 			context.addScopeVar(decl.id);
 			if (decl.init) {
 				context.assign(decl.id, decl.init);
 			}
-		});
+		}
 	},
 
 	FunctionDeclaration(context: Context, node: ESTree.FunctionDeclaration) {
@@ -572,9 +586,9 @@ const stmtHandlers: { [type: string]: (context: Context, item: ESTree.Statement)
 		if (node.handler && context.pendingThrows.length > 0) {
 			const allGood = context.insertPendingGoto();
 
-			context.pendingThrows.forEach(goto => {
+			for (const goto of context.pendingThrows) {
 				goto.resolve();
-			});
+			}
 
 			context.pendingThrows = [];
 
@@ -671,7 +685,9 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 	const context = new Context();
 	context.addScopeVar(Context.__ERROR);
 	context.addScopeVar(Context.__RESULT);
-	ast.body.forEach(node => context.transformStmt(node));
+	for (const stmt of ast.body) {
+		context.transformStmt(stmt);
+	}
 	context.leave();
 
 	writeFileSync('test.out.js', generate(build.program(context.statements), { comment: true }));
