@@ -4,7 +4,7 @@ import { parse } from 'acorn';
 import { readFileSync, writeFileSync } from 'fs';
 import { generate } from 'escodegen';
 
-type ReusableExpr = ESTree.Identifier | ESTree._SimpleLiteral;
+type ReusableExpr = ESTree.Identifier | ESTree._SimpleLiteral | ESTree.Identifier & { name: 'undefined' };
 
 interface GotoStmt {
 	stmt: ESTree.Statement;
@@ -37,11 +37,11 @@ interface BranchingGotoStatement extends ESTree.IfStatement {
 }
 
 interface TempVar extends ESTree.Identifier {
-	kind: 'temp';
+	refCounter: number;
 }
 
 function isTempVar(node: ESTree.Expression): node is TempVar {
-	return is(node, 'Identifier') && (node as TempVar).kind === 'temp';
+	return is(node, 'Identifier') && typeof (node as TempVar).refCounter === 'number';
 }
 
 function isSimpleLiteral(node: ESTree.Expression): node is ESTree._SimpleLiteral {
@@ -252,21 +252,29 @@ class Context {
 	}
 
 	useTempVar(init: ESTree.Expression): ReusableExpr {
-		if (isTempVar(init) || isSimpleLiteral(init)) {
+		if (isTempVar(init)) {
+			init.refCounter++;
+			return init;
+		}
+		if (isSimpleLiteral(init) || is(init, 'Identifier') && init.name === 'undefined') {
 			return init;
 		}
 		let id = this.freeVars.pop();
 		if (!id) {
-			id = Object.assign(build.ident(`$${this.varCounter++}`), { kind: 'temp' as 'temp' });
+			id = Object.assign(build.ident(`$${this.varCounter++}`), { refCounter: 0 });
 			this.addScopeVar(id);
 		}
+		id.refCounter++;
 		this.assign(id, init);
 		return id;
 	}
 
 	freeTempVar(id: ReusableExpr) {
-		if (isTempVar(id)) {
-			this.freeVars.push(id);
+		if (isTempVar(id) && id.refCounter > 0) {
+			--id.refCounter;
+			if (id.refCounter === 0) {
+				this.freeVars.push(id);
+			}
 		}
 	}
 
@@ -335,6 +343,9 @@ class Context {
 	}
 
 	leave() {
+		if (this.varCounter !== this.freeVars.length) {
+			throw new Error(`Attempted to leave the context with ${this.varCounter - this.freeVars.length} locked registers`);
+		}
 		if (this.labelStack.length > 0) {
 			throw new Error(`Attempted to leave the context with non-empty label stack: ${this.labelStack.map(label => label.name).join(', ')}`);
 		}
@@ -375,14 +386,25 @@ class Context {
 		if (!(stmt.type in stmtHandlers)) {
 			throw new ReferenceError(`Unhandled type ${stmt.type}.`);
 		}
+		let lockedVars = this.varCounter - this.freeVars.length;
 		stmtHandlers[stmt.type](this, stmt);
+		lockedVars = this.varCounter - this.freeVars.length - lockedVars;
+		if (lockedVars) {
+			throw new Error(`Attempted to leave ${stmt.type} handler with ${lockedVars} locked registers.`);
+		}
 	}
 
 	transformExpr(expr: ESTree.Expression) {
 		if (!(expr.type in exprHandlers)) {
 			throw new ReferenceError(`Unhandled type ${expr.type}.`);
 		}
-		return exprHandlers[expr.type](this, expr);
+		let lockedVars = this.varCounter - this.freeVars.length;
+		const evaluatedExpr = exprHandlers[expr.type](this, expr);
+		lockedVars = this.varCounter - this.freeVars.length - lockedVars;
+		if (lockedVars) {
+			throw new Error(`Attempted to leave ${expr.type} handler with ${lockedVars} locked registers.`);
+		}
+		return evaluatedExpr;
 	}
 }
 
@@ -615,11 +637,15 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 
 	CallExpression(context: Context, node: ESTree.CallExpression) {
 		let thisExpr: ReusableExpr | undefined;
-		let callee = node.callee;
+		const { callee } = node;
 		if (is(callee, 'MemberExpression')) {
 			thisExpr = callee.object = context.useTempVar(callee.object);
 		}
-		return context.execForeign('CALL', [callee, thisExpr || build.undef()].concat(node.arguments));
+		const result = context.execForeign('CALL', [callee, thisExpr || build.undef()].concat(node.arguments));
+		if (thisExpr) {
+			context.freeTempVar(thisExpr);
+		}
+		return result;
 	},
 
 	UnaryExpression(context: Context, node: ESTree.UnaryExpression) {
@@ -640,7 +666,7 @@ const exprHandlers: { [type: string]: (context: Context, item: ESTree.Expression
 };
 
 {
-	const ast = parse(readFileSync('test.js', 'utf-8'), { locations: true });
+	const ast = parse(readFileSync('test.js', 'utf-8'), { ecmaVersion: 5, locations: true });
 
 	const context = new Context();
 	context.addScopeVar(Context.__ERROR);
